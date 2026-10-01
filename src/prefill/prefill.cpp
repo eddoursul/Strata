@@ -3,6 +3,7 @@
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -131,6 +132,25 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     next();
     a.used = u1;
     return b;
+}
+
+// K and V of T cells from pos0 ([T, 2, 256] each) into a state's pools, in its format (the decode append's arithmetic)
+void append_kv(const core::QsaState& st, const float* Kr, const float* Vr, int64_t T, int64_t pos0,
+               const strata::kernels::QsaShapes& s, cudaStream_t cs) {
+    using strata::kernels::kv_append_q4_rows;
+    switch (st.kv) {
+    case core::KvFormat::Q4:
+        kv_append_q4_rows(st.k_q4, st.k_q4s, st.v_q4, st.v_q4s, st.page_table, pos0, T, Kr, Vr, 512, s, cs);
+        break;
+    case core::KvFormat::K8V4:
+        kv_append(Kr, Vr, T, pos0, st.page_table, s.page_size, nullptr, nullptr, st.k_q, nullptr, st.k_scale, nullptr, cs,
+                  1);
+        kv_append_q4_rows(nullptr, nullptr, st.v_q4, st.v_q4s, st.page_table, pos0, T, Kr, Vr, 512, s, cs);
+        break;
+    default:
+        kv_append(Kr, Vr, T, pos0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                  st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs);
+    }
 }
 
 strata::kernels::QsaShapes shapes_of(const core::ModelGeometry& g) {
@@ -392,8 +412,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             m.gemm.f16(b.mixed_h, Wv, b.Vc, P, 512, N);
             rms_rows(b.Kc, dk.k_norm, P * 2, 256, 256, EPS, m.cs);
             rope(b.Kc, P, 2, 256, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
-            kv_append(b.Kc, b.Vc, P, pp, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs);
+            append_kv(st, b.Kc, b.Vc, P, pp, s, m.cs);
         }
         return true;
     };
@@ -601,8 +620,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (!bf16_proj(m.gemm, wiq, b.mixed_bf, b.q_idx, P, v.name("indexer.q_proj.weight"), err)) return false;
                         rms_rows(b.Kc, (const float*) wkn->data, P * 2, 256, 256, EPS, m.cs);
                         rope(b.Kc, P, 2, 256, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
-                        kv_append(b.Kc, b.Vc, P, pp, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                                  st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs);
+                        append_kv(st, b.Kc, b.Vc, P, pp, s, m.cs);
                         split_q(b.Qf, b.q, P, m.cs);
                         rms_rows(b.q, (const float*) wqn->data, P * 24, 256, 256, EPS, m.cs);
                         rope(b.q, P, 24, 256, 6144, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
@@ -628,10 +646,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             strata::kernels::qsa_block_topk(b.sel_scores, steps + q0 * SC, nb, m.max_blocks, m.cap, s,
                                                             b.sel_ids + q0 * m.cap, m.cs);
                         }
-                        strata::kernels::QsaAttnPools pools;
-                        pools.page_table = st.page_table;
-                        if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
-                        else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
+                        const strata::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
                         mark(kPsQsaAttn);
                         strata::kernels::qsa_prefill_attn(b.q, pools, b.sel_ids, steps, m.cap, s, b.attn, P, m.cs);
                         mark(kPsQsaOut);

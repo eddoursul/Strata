@@ -38,9 +38,11 @@
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -191,6 +193,10 @@ bool layer_shared_early();
 
 // ================================ the QSA mixer ================================
 
+/// The K/V storage of a QSA layer (`--kv`): FP16; INT8 codes with an FP16 scale per 64 values (kv_q8.hpp); 4-bit K
+/// and V of rotated rows (q4_0) or INT8 K with 4-bit V (k8v4; kv_q4.hpp).
+enum class KvFormat : int { F16 = 0, Int8 = 1, Q4 = 2, K8V4 = 3 };
+
 /// THE PERSISTENT STATE OF ONE QSA LAYER FOR ONE SEQUENCE: the KV cache, the indexer's pooled keys, the rope
 /// tables, and the per-token step buffer.  None of it is scratch - it survives every token.
 ///
@@ -198,14 +204,21 @@ bool layer_shared_early();
 /// shorter than the sequence would have `rope_neox_apply` read past it, which is a wrong rotation rather than a
 /// fault.
 struct QsaState {
-    uint16_t* k_pool = nullptr;      ///< [page][kv_head][page_size][head_dim] fp16 (null in INT8 mode)
+    KvFormat kv = KvFormat::F16;
+    uint16_t* k_pool = nullptr;      ///< [page][kv_head][page_size][head_dim] fp16 (KvFormat::F16)
     uint16_t* v_pool = nullptr;
-    /// Plan v0.3 P7: INT8 KV (qsa_set_kv_int8). Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64.
-    bool kv_int8 = false;
+    /// Plan v0.3 P7: INT8 KV. Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64 (K in K8V4 too).
+    bool kv_int8 = false;            ///< KvFormat::Int8: K and V
     int8_t* k_q = nullptr;
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
+    /// 4-bit KV (kv_q4.hpp): codes [page][kv_head][page_size][head_dim / 2], scales [...][head_dim / 32]; K in Q4,
+    /// V in Q4 and K8V4
+    uint8_t* k_q4 = nullptr;
+    uint8_t* v_q4 = nullptr;
+    uint16_t* k_q4s = nullptr;
+    uint16_t* v_q4s = nullptr;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page
     int64_t n_pages = 0;
     int64_t max_cells = 0;
@@ -239,19 +252,35 @@ struct QsaState {
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
 };
 
+/// The format of the model's QSA layers (`--kv`): set before sizing and initializing the session.
+void qsa_set_kv_format(KvFormat f);
+KvFormat qsa_kv_format();
+/// The MTP draft layer's: INT8 under the 4-bit formats (its K/V is one layer's, its drafts the speed).
+KvFormat qsa_draft_kv_format();
+
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
-/// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true);
-/// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
-/// initializing the session; default off until gate G-C accepts it.
-void qsa_set_kv_int8(bool enabled);
-bool qsa_kv_int8();
+/// instead of building a copy (the session builds it once, in the first QSA layer).  `kv`: the K/V format.
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true,
+                         KvFormat kv = qsa_kv_format());
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr);
+                        const QsaState* share_rope = nullptr, KvFormat kv = qsa_kv_format());
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// The attention kernels' view of the state's K/V pools (qsa_decode_attn.hpp).
+strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
+/// Appends n_tok cells in the state's format (graph-capturable): token t's step record at step + t * step_stride,
+/// its K and V rows at kcur/vcur + t * n_head_kv * head_dim (4-bit sides rotated and quantized here).
+void qsa_kv_append_steps(const QsaState& st, const ModelGeometry& g, const int32_t* step, int step_stride,
+                         const float* kcur, const float* vcur, int n_tok, void* stream);
+/// The state's K/V arrays, laid out [page][kv_head][page_size][...] (with an identity page table the first cells
+/// are one prefix of each), and their bytes per cell and KV head.
+struct KvArray {
+    void* data;
+    uint64_t row_bytes;
+};
+std::vector<KvArray> qsa_kv_arrays(const QsaState& st, const ModelGeometry& g);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //

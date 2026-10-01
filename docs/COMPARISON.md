@@ -144,6 +144,6 @@ faster on fixed text, and reads prompts about as fast.
 | Speculative decoding | none: no graph for this model's MTP layer | the MTP layer's drafts, up to 3 a pass; prompt lookup (up to 5 tokens where it pays) | the MTP layer's drafts; prompt lookup (up to 7 tokens after a 16+-token match) |
 | Several GPUs | a layer or row split | a layer split, each card holding its layers' experts | the second card as an expert tier: its share of each layer, the next layer's likely experts copied ahead, the prompt's experts the first card lacks, part of the output head |
 | Experts in VRAM | a fixed placement | ranked by use, updated every 4 verify passes | ranked by use on both cards, updated every pass |
-| KV cache | 8-bit, in VRAM | 8-bit, in RAM past 32K cells | 8-bit, in VRAM |
+| KV cache | 8-bit, in VRAM | 8-bit, in RAM past 32K cells; 4-bit options | 8-bit, in VRAM; 4-bit options (q4_0, k8v4) in the tensor-core attention |
 | Prompt cache | the live slot, states saved to RAM | checkpoints at turns and every 16K tokens | the live sequence, checkpoints at turns and chunks, replaced conversations kept in RAM with their K/V |
 | Sampling, APIs | full; OpenAI and Anthropic | per request; OpenAI and Anthropic, a web app, MCP tools | upstream's |

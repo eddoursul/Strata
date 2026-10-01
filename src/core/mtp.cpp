@@ -171,12 +171,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
     for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
 
-    // ---- the layer's own K/V (dense attention: no indexer state is read)
+    // ---- the layer's own K/V (dense attention: no indexer state is read), FP16 or INT8 (qsa_draft_kv_format)
     const strata::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[0].max_cells;
-    const uint64_t sb = qsa_state_bytes(g, max_cells, false);
+    const uint64_t sb = qsa_state_bytes(g, max_cells, false, qsa_draft_kv_format());
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0]) == 0) { err = "mtp: state init failed"; return false; }
+    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], qsa_draft_kv_format()) == 0) {
+        err = "mtp: state init failed";
+        return false;
+    }
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;

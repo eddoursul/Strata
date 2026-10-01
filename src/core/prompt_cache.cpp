@@ -1,7 +1,6 @@
 // src/core/prompt_cache.cpp - the --serve prompt cache (see include/strata/core/prompt_cache.hpp).
 #include "strata/core/prompt_cache.hpp"
 
-#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <cuda_runtime.h>
@@ -105,21 +104,12 @@ std::vector<PromptCache::Part> PromptCache::kv_parts(int64_t cells) const {
     // [page][kv_head][page_size][head_dim] with an identity page table: the first cells are one prefix of each
     // pool.  The indexer's pooled rows are one per idx_block cells.
     const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
-    const uint64_t hd = (uint64_t) g_.head_dim, row = (uint64_t) g_.idx_key_dim * sizeof(float);
+    const uint64_t row = (uint64_t) g_.idx_key_dim * sizeof(float);
     std::vector<Part> parts;
     for (QsaState* st : kv_) {
         const uint64_t pages = (uint64_t) std::min<int64_t>(st->n_pages, (cells + sh.page_size - 1) / sh.page_size);
         const uint64_t c = pages * (uint64_t) g_.n_head_kv * (uint64_t) sh.page_size;
-        if (st->kv_int8) {
-            const uint64_t scales = c * (hd / strata::kernels::KV_Q8_GROUP) * sizeof(uint16_t);
-            parts.push_back({st->k_q, c * hd});
-            parts.push_back({st->v_q, c * hd});
-            parts.push_back({st->k_scale, scales});
-            parts.push_back({st->v_scale, scales});
-        } else {
-            parts.push_back({st->k_pool, c * hd * sizeof(uint16_t)});
-            parts.push_back({st->v_pool, c * hd * sizeof(uint16_t)});
-        }
+        for (const KvArray& a : qsa_kv_arrays(*st, g_)) parts.push_back({a.data, c * a.row_bytes});
         const int64_t rows = std::min<int64_t>(cells / sh.idx_block + 2, st->max_cells / sh.idx_block + 2);
         parts.push_back({st->idx_pooled, (uint64_t) rows * row});
     }

@@ -7,8 +7,8 @@ The configs this fork runs with on a PC with an RTX 3090, an RTX 5070 Ti and 160
 - `ud-q4_k_xl.json`: unsloth's UD-Q4_K_XL (~81 GB of RAM taken).
 
 This branch's engine leaves out some of upstream's options, which [DETAILS.md](../docs/DETAILS.md) describes and
-setup may write into its own configs: the layer split and the helper GPUs' caches, KV streaming and the 4-bit KV caches
-(`--kv q4_0`, `k8v4`: 8-bit and FP16 only), the low-RAM modes, the experimental speed projection (control vectors),
+setup may write into its own configs: the layer split and the helper GPUs' caches, KV streaming (`--kv-resident`: the
+KV cache stays in VRAM), the low-RAM modes, the experimental speed projection (control vectors),
 upstream's conversation cache (`--conversation-cache-mib`; the prompt cache here keeps replaced conversations in RAM),
 rope scaling past the trained 262K context (`--rope-scaling`), and the AMD, Turing and Pascal builds.
 

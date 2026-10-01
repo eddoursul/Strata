@@ -304,8 +304,9 @@ void usage() {
                  "  --ple-inflight N     outstanding SSD reads (default 64)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
-                 "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
-                 "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                 "  --kv fp16|int8|k8v4|q4_0  KV storage: int8 codes + fp16 scale per 64 values (half FP16's VRAM);\n"
+                 "                       k8v4: int8 K, 4-bit V of rotated rows (23%% less than int8); q4_0: 4-bit K\n"
+                 "                       and V (45%% less; native packs only for both); default fp16\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -969,8 +970,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
         return 2;
     }
-    if (o.kv != "fp16" && o.kv != "int8") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16 or int8\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "k8v4" && o.kv != "q4_0") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, k8v4 or q4_0\n");
         return 2;
     }
     // every CUDA call from here on uses this device; the adaptive tier sets it on its own thread too
@@ -985,7 +986,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --second-gpu %d is not another visible CUDA device\n", o.second_gpu);
         return 2;
     }
-    strata::core::qsa_set_kv_int8(o.kv == "int8");
+    strata::core::qsa_set_kv_format(o.kv == "int8"   ? strata::core::KvFormat::Int8
+                                    : o.kv == "k8v4" ? strata::core::KvFormat::K8V4
+                                    : o.kv == "q4_0" ? strata::core::KvFormat::Q4
+                                                     : strata::core::KvFormat::F16);
     strata::core::layer_set_shared_early(!o.shared_late);
     std::vector<std::string> native_shards;   // the --native model's GGUF shards
     if (!o.native_preset.empty()) {
@@ -1098,6 +1102,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+    if (!native_pack && (o.kv == "k8v4" || o.kv == "q4_0")) {
+        std::fprintf(stderr, "strata generate: --kv %s needs a native pack (--native): the 4-bit formats run in its "
+                             "verify windows\n", o.kv.c_str());
+        return 2;
+    }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well

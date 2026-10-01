@@ -475,13 +475,14 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
     o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
 }
 
-// one block per (token, kv head, 64-value group); 64 threads
+// one block per (token, kv head, 64-value group[, side]); 64 threads
 __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
-                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale) {
+                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+                                 int sides) {
     const int64_t t = blockIdx.x;
-    const int kvh = blockIdx.y, g = blockIdx.z >> 1;
-    const bool is_v = (blockIdx.z & 1) != 0;
+    const int kvh = blockIdx.y, g = sides == 3 ? blockIdx.z >> 1 : blockIdx.z;
+    const bool is_v = sides == 3 ? (blockIdx.z & 1) != 0 : sides == 2;
     const int d = g * 64 + threadIdx.x;
     const float x = (is_v ? V : K)[t * 512 + kvh * 256 + d];
     const int64_t pos = pos0 + t;
@@ -517,10 +518,10 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream) {
-    if (T <= 0) return;
-    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(K, V, pos0, page_table, page_size, k_pool,
-                                                                                  v_pool, k_q, v_q, k_scale, v_scale);
+               void* stream, int sides) {
+    if (T <= 0 || sides < 1 || sides > 3) return;
+    kv_append_kernel<<<dim3((unsigned) T, 2, sides == 3 ? 8 : 4), 64, 0, (cudaStream_t) stream>>>(
+        K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale, sides);
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {

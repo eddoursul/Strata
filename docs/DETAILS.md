@@ -59,16 +59,28 @@ attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU.
 costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
 it on.
 
-**4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
-halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
-is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
-Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
+**4-bit KV caches (`--kv q4_0` and `--kv k8v4`, optional):** upstream's formats (PR #21 and #120): each head's keys
+and values are rotated by a Walsh-Hadamard transform, which spreads their outlier channels over all 256 values, then
+stored as 4-bit codes in blocks of 32 with an FP16 scale each. `q4_0` stores the keys and the values that way (576
+bytes a token and QSA layer against 8-bit's 1,056: 45% less), `k8v4` the values only, with 8-bit keys (816 bytes: 23%
+less). This fork runs them in its tensor-core attention like 8-bit (native packs only; the MTP draft layer keeps
+8-bit), and the VRAM they free goes to the expert cache. On an RTX 3090 at 200K context (with an RTX 5070 Ti as the
+second tier):
 
-**Hybrid K8V4 KV cache (engine 0.1.25, optional, PR #120):** `--kv k8v4` (`START-HERE.bat --setup --kv k8v4`) keeps
-the keys at 8 bits and stores the values as rotated 4-bit: 23% less KV memory than 8-bit, so more experts fit in
-VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the same needle results, prompts 2-5%
-slower. It does not stream its KV cache (KV streaming is on by default from 64K), so it pays off mostly on large
-cards at long contexts.
+| | 8-bit | k8v4 | q4_0 |
+| --- | ---: | ---: | ---: |
+| KV cache of the 12 QSA layers | 2.36 GiB | 1.82 GiB | 1.29 GiB |
+| Experts in the 3090's cache: IQ3_S / UD-Q4_K_XL | 7,546 / 4,539 | 7,835 / 4,722 | 8,116 / 4,908 |
+| Generation, ms per verify pass on fixed text | | 0.1-1.8% less (one workload 1.5% more) | 0.4-1.9% less |
+| The prompt's attention (2,048 queries of 2,051 cells) | 4.7 ms | 3.5 ms | 3.3 ms |
+
+The cost is precision. Along llama.cpp's texts, the next-token distributions are 1.3-3.5x as far from llama.cpp's as
+8-bit's (mean KL; IQ3_S thinking 2.1e-3 against 4.7e-3 and 7.4e-3, after a 16K-token prompt 1.0e-3 against 2.5e-3 and
+3.2e-3; UD-Q4_K_XL 6.7e-3 against 9.0e-3 and 1.2e-2, after 16K 3.5e-3 against 5.4e-3 and 6.4e-3): k8v4 moves them
+about as far as one change of rounding does (llama.cpp's CPU backend against its CUDA backend), q4_0 two to three times
+that. Upstream measured q4_0's perplexity on long documents 8-12% higher and k8v4's needle results the same as
+8-bit's ([`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md)). 8-bit stays the default;
+the 4-bit formats also fit a longer context into the same VRAM (q4_0 at 262K takes less than 8-bit at 200K).
 
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round

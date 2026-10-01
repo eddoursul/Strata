@@ -4,7 +4,9 @@
 // all `n_head / n_head_kv` query heads that share a KV head from one read of each cell: a block per (KV head, query)
 // walks the query's cells in tiles of 64 with an online softmax.  INT8 pools on the tensor cores: q and the
 // probabilities as 24-bit fixed point (three 8-bit limbs) against the int8 codes, the integer sums exact, ~2.5e-6 of
-// a head's largest output from FP64 on real prompts (FP32 kernels ~3e-6).  FP16 pools in FP32.
+// a head's largest output from FP64 on real prompts (FP32 kernels ~3e-6).  4-bit sides (kv_q4.hpp: --kv q4_0's K and
+// V, k8v4's V) the same way, their codes made signed bytes: the queries of a rotated K are rotated and the output of a
+// rotated V rotated back inside, so callers pass and get the model's vectors whatever the format.  FP16 pools in FP32.
 //
 // The prompt path's queries fill the GPU by their number.  A verify window's 1-4 queries would leave most of it idle,
 // so the decode splits each query's cells among up to 20 blocks (whole tiles, all queries' blocks in one wave) whose
@@ -18,15 +20,19 @@
 
 namespace strata::kernels {
 
+/// The K and V pools of one QSA layer: FP16 (k_pool, v_pool), INT8 (k_q ... v_scale), INT8 K with 4-bit V (k_q,
+/// k_scale, v_q4, v_q4s: k8v4) or 4-bit K and V (k_q4 ... v_q4s: q4_0).
 struct QsaAttnPools {
-    const uint16_t* k_pool = nullptr;   ///< fp16 [page][kv_head][page_size][head_dim], or null when int8
+    const uint16_t* k_pool = nullptr;   ///< fp16 [page][kv_head][page_size][head_dim]
     const uint16_t* v_pool = nullptr;
     const int8_t* k_q = nullptr;        ///< int8 codes, same layout
     const int8_t* v_q = nullptr;
     const uint16_t* k_scale = nullptr;  ///< fp16 [page][kv_head][page_size][head_dim / 64]
     const uint16_t* v_scale = nullptr;
-    const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
+    const uint8_t* k_q4 = nullptr;      ///< 4-bit codes of rotated rows [page][kv_head][page_size][head_dim / 2]
     const uint8_t* v_q4 = nullptr;
+    const uint16_t* k_q4s = nullptr;    ///< fp16 [page][kv_head][page_size][head_dim / 32]
+    const uint16_t* v_q4s = nullptr;
     const int32_t* page_table = nullptr;
 };
 

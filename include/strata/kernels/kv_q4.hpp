@@ -1,15 +1,16 @@
-// include/strata/kernels/kv_q4.hpp - Q4_0 KV storage with Walsh-Hadamard rotation for the QSA layers (`--kv q4_0`).
+// include/strata/kernels/kv_q4.hpp - 4-bit KV storage for the QSA layers: `--kv q4_0` (K and V) and `--kv k8v4` (V,
+// with K in INT8, kv_q8.hpp).
 //
-// From PR #21 (code-martin). K and V are rotated by the orthonormal 256-point Hadamard matrix H before they are
-// quantized to ggml's q4_0 (32 values per block: an fp16 scale + 16 bytes of 4-bit codes, 144 B per head per cell,
-// 576 B per cell for K and V of both heads, vs 1,056 B in INT8). The rotation spreads a head's outlier channels
-// over all 256 dimensions, which is what makes 4 bits usable. The query is rotated the same way, so
-// <Hq, Hk> = <q, k> and the scores are unchanged, and the attention output (a mix of rotated values) is rotated
-// back with H (self-inverse). What is lossy is the 4-bit rounding itself: measured, not assumed, in
-// bench/results/2026-09-27-kv-q4.
+// Upstream's formats (PR #21, code-martin; PR #120): a head's 256 values are rotated by the orthonormal Walsh-Hadamard
+// transform H (fwht256_warp, src/kernels/cuda/fwht.cuh), which spreads its outlier channels over all of them, and then
+// stored as 4-bit codes in blocks of 32 values with one FP16 scale each, ggml's q4_0 rounding against the stored scale:
+//     d = fp16(the value of largest magnitude / -8),  code = clamp(rint(x / d) + 8, 0, 15),  x' = (code - 8) d
+// <Hq, Hk> = <q, k>: the attention rotates its queries when K is rotated, and its output, a mix of rotated values,
+// back (H is its own inverse), so the attention's callers see neither rotation.
 //
-// With KV streaming (--kv-resident) the codes live in the host copy and the resident slots like INT8's (KvHostPools
-// k_q4/v_q4, the same block granule), so both options combine.
+// The codes and the scales are separate arrays, as in the INT8 pools, so the attention fetches both in 16-byte copies:
+// codes [page][kv_head][page_size][head_dim / 2] (block b's byte j: value 32b + j in the low nibble, 32b + j + 16 in
+// the high one), scales [page][kv_head][page_size][head_dim / 32].  144 bytes per cell and head, against 264 in INT8.
 #pragma once
 
 #include "strata/kernels/qsa.hpp"
@@ -18,44 +19,26 @@
 
 namespace strata::kernels {
 
-inline constexpr int QK4_0 = 32;
+inline constexpr int KV_Q4_GROUP = 32;
 
-#pragma pack(push, 1)
-struct block_q4_0 {
-    uint16_t d;             // scale (fp16 bits)
-    uint8_t qs[QK4_0 / 2];  // 32 4-bit codes: element j in the low nibble of qs[j], j + 16 in the high one
-};
-#pragma pack(pop)
-
-static_assert(sizeof(block_q4_0) == 18, "block_q4_0 must be 18 bytes");
-
-/// Bytes per cell and KV head: 8 blocks of 32 for head_dim 256 -> 144.
-inline uint64_t kv_q4_bytes_per_head(int head_dim) { return (uint64_t) (head_dim / QK4_0) * sizeof(block_q4_0); }
-
-/// Bytes per cell (one token, one layer): K and V of every KV head.
-inline uint64_t kv_q4_bytes_per_cell(const QsaShapes& s) {
-    return (uint64_t) s.n_head_kv * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+/// Bytes per cell (one token, one layer) of one 4-bit side, K or V: codes and scales of every KV head.
+inline uint64_t kv_q4_bytes_per_side(const QsaShapes& s) {
+    return (uint64_t) s.n_head_kv * ((uint64_t) s.head_dim / 2 + (uint64_t) (s.head_dim / KV_Q4_GROUP) * 2);
 }
 
-/// Orthonormal Fast Walsh-Hadamard Transform of rows of 256 floats (scale 1/16): its own inverse.
-void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream);
-inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fwht256_cuda(data, data, n_rows, stream); }
+/// Appends n_tok cells (graph-capturable): token t's step record at step + t * step_stride (its position at
+/// kStepPos), its K and V rows at kcur/vcur + t * n_head_kv * head_dim.  K is rotated and stored when k_q4 is
+/// given, V when v_q4 is.
+void kv_append_q4_steps(uint8_t* k_q4, uint16_t* k_q4s, uint8_t* v_q4, uint16_t* v_q4s, const int32_t* page_table,
+                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int n_tok,
+                        const QsaShapes& s, void* stream);
 
-/// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
-/// and to VRAM only if its block is resident.
-void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
-                       const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host = nullptr);
+/// The prompt path's form: T cells from position pos0, token t's K and V rows at K/V + t * ld.
+void kv_append_q4_rows(uint8_t* k_q4, uint16_t* k_q4s, uint8_t* v_q4, uint16_t* v_q4s, const int32_t* page_table,
+                       int64_t pos0, int64_t T, const float* K, const float* V, int64_t ld, const QsaShapes& s,
+                       void* stream);
 
-/// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
-/// layout, the one-layer staging pool of a streamed session) when given.
-void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
-                  const float* V, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr,
-                  const KvHostPools* stage = nullptr);
-
-/// Gather step[kStepWidth] cells named by `ids` into FP16 scratch [id][kv_head][head_dim] (still rotated).
-void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,
-                       const int32_t* step, int64_t max_ids, const QsaShapes& s, uint16_t* k_scratch,
-                       uint16_t* v_scratch, void* stream);
+/// H applied to n_rows rows of 256 floats in place (fwht256_warp: the tests' and the tools' form).
+void fwht256_rows(float* x, int64_t n_rows, void* stream);
 
 }  // namespace strata::kernels

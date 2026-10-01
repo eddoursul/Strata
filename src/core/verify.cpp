@@ -698,18 +698,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), qcur_ + tb * NH * HD, wqn, (int) NH, (int) HD,
                           shs_);
                 if (!mark(shs_, pjoin_) || !wait(kjoin_)) return false;
-                if (st.kv_int8)
-                    kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_ + tb * kStepCount,
-                                       (int) kStepCount, kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD, n, s, cs);
-                else
-                    for (int t = tb; t < te; ++t)
-                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount, kcur_ + t * NKV * HD,
-                                       vcur_ + t * NKV * HD, s, cs);
+                qsa_kv_append_steps(st, g, step_ + tb * kStepCount, (int) kStepCount, kcur_ + tb * NKV * HD,
+                                    vcur_ + tb * NKV * HD, n, cs);
                 if (!wait(bjoin_) || !wait(pjoin_)) return false;
-                QsaAttnPools pools;
-                pools.page_table = st.page_table;
-                if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
-                else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
+                const QsaAttnPools pools = qsa_attn_pools(st);
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn32_ + tb * NH * HD,
                                       n, cs, qfull_ + tb * NH * 2 * HD);

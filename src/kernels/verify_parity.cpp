@@ -10,6 +10,8 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -905,6 +907,137 @@ int test_kv_append(std::mt19937& rng, cudaStream_t s) {
     return bad;
 }
 
+// H on a 256-value row in the device's operation order (fwht256_warp): the scale, then the butterflies by index bit
+template <typename T> void fwht256_host(T* x) {
+    for (int i = 0; i < 256; ++i) x[i] *= (T) 0.0625;
+    T y[256];
+    for (int h = 1; h < 256; h <<= 1) {
+        for (int e = 0; e < 256; ++e) y[e] = (e & h) ? x[e ^ h] - x[e] : x[e] + x[e ^ h];
+        std::copy(y, y + 256, x);
+    }
+}
+
+// a head's 256 values -> its 4-bit row (128 code bytes, 8 scales), kv_q4.hpp's rounding
+void q4_row_host(const float* in, uint8_t* codes, uint16_t* scales) {
+    float x[256];
+    std::copy(in, in + 256, x);
+    fwht256_host(x);
+    for (int b = 0; b < 8; ++b) {
+        float a = std::fabs(x[32 * b]), m = x[32 * b];
+        for (int j = 1; j < 32; ++j) {
+            const float v = x[32 * b + j];
+            if (std::fabs(v) > a || (std::fabs(v) == a && v > m)) { a = std::fabs(v); m = v; }
+        }
+        scales[b] = strata::kernels::f16_from_f32(m / -8.0f);
+        const float d = strata::kernels::f32_from_f16(scales[b]);
+        int q[32];
+        for (int j = 0; j < 32; ++j)
+            q[j] = d != 0.0f ? std::min(15, std::max(0, (int) std::nearbyint(x[32 * b + j] / d) + 8)) : 8;
+        for (int j = 0; j < 16; ++j) codes[16 * b + j] = (uint8_t) (q[j] | (q[j + 16] << 4));
+    }
+}
+
+// ---- the 4-bit appends (the verify window's and the prompt path's) against the host, and the INT8 append of K alone
+int test_kv_q4(std::mt19937& rng, cudaStream_t s) {
+    const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+    const int NKV = (int) sh.n_head_kv, HD = (int) sh.head_dim, cells = 4096, pages = cells / (int) sh.page_size;
+    const int per_tok = NKV * HD;
+    const size_t rows = (size_t) cells * NKV;
+    std::vector<int32_t> table((size_t) pages);
+    for (int i = 0; i < pages; ++i) table[(size_t) i] = (i * 5 + 2) % pages;
+    int32_t* d_table = dev<int32_t>(table.size());
+    up(d_table, table);
+    uint8_t *d_c[2][2];
+    uint16_t* d_s[2][2];   // [form: steps, rows][K, V]
+    for (int f = 0; f < 2; ++f)
+        for (int kv = 0; kv < 2; ++kv) {
+            d_c[f][kv] = dev<uint8_t>(rows * 128);
+            d_s[f][kv] = dev<uint16_t>(rows * 8);
+        }
+    int bad = 0;
+    for (int n_tok : {1, 3, 8, 37}) {
+        const int p0 = 100 + (int) (rng() % 3000);
+        std::vector<float> k((size_t) n_tok * per_tok), v((size_t) n_tok * per_tok);
+        for (auto& x : k) x = edgy(rng);
+        for (auto& x : v) x = edgy(rng);
+        std::vector<int32_t> steps((size_t) n_tok * strata::kernels::kStepCount, 0);
+        for (int t = 0; t < n_tok; ++t) steps[(size_t) t * strata::kernels::kStepCount + strata::kernels::kStepPos] = p0 + t;
+        float *d_k = dev<float>(k.size()), *d_v = dev<float>(v.size());
+        int32_t* d_steps = dev<int32_t>(steps.size());
+        up(d_k, k); up(d_v, v); up(d_steps, steps);
+        for (int f = 0; f < 2; ++f)
+            for (int kv = 0; kv < 2; ++kv) {
+                check(cudaMemset(d_c[f][kv], 0, rows * 128), "memset");
+                check(cudaMemset(d_s[f][kv], 0, rows * 16), "memset");
+            }
+        if (n_tok <= 8)
+            strata::kernels::kv_append_q4_steps(d_c[0][0], d_s[0][0], d_c[0][1], d_s[0][1], d_table, d_steps,
+                                                strata::kernels::kStepCount, d_k, d_v, n_tok, sh, s);
+        strata::kernels::kv_append_q4_rows(d_c[1][0], d_s[1][0], d_c[1][1], d_s[1][1], d_table, p0, n_tok, d_k, d_v,
+                                           per_tok, sh, s);
+        check(cudaStreamSynchronize(s), "q4 append");
+        std::vector<uint8_t> hc(rows * 128, 0);
+        std::vector<uint16_t> hs(rows * 8, 0);
+        for (int kv = 0; kv < 2; ++kv) {
+            std::fill(hc.begin(), hc.end(), 0);
+            std::fill(hs.begin(), hs.end(), 0);
+            for (int t = 0; t < n_tok; ++t)
+                for (int h = 0; h < NKV; ++h) {
+                    const int pos = p0 + t;
+                    const size_t row = ((size_t) table[(size_t) (pos / sh.page_size)] * NKV + h) * sh.page_size +
+                                       pos % sh.page_size;
+                    q4_row_host((kv ? v : k).data() + (size_t) t * per_tok + h * HD, hc.data() + row * 128,
+                                hs.data() + row * 8);
+                }
+            for (int f = n_tok <= 8 ? 0 : 1; f < 2; ++f)
+                if (down(d_c[f][kv], rows * 128) != hc || down(d_s[f][kv], rows * 8) != hs) {
+                    std::fprintf(stderr, "kv_q4: n_tok %d: the %s form's %s rows differ from the host's\n", n_tok,
+                                 f ? "prompt" : "verify", kv ? "V" : "K");
+                    ++bad;
+                }
+        }
+        cudaFree(d_k); cudaFree(d_v); cudaFree(d_steps);
+    }
+    // k8v4's INT8 half: K alone equals a both-sides append's K and leaves V untouched
+    {
+        const int n_tok = 5, p0 = 777;
+        const size_t codes = rows * HD, scales = codes / strata::kernels::KV_Q8_GROUP;
+        std::vector<float> k((size_t) n_tok * per_tok), v((size_t) n_tok * per_tok);
+        for (auto& x : k) x = edgy(rng);
+        for (auto& x : v) x = edgy(rng);
+        std::vector<int32_t> steps((size_t) n_tok * strata::kernels::kStepCount, 0);
+        for (int t = 0; t < n_tok; ++t) steps[(size_t) t * strata::kernels::kStepCount + strata::kernels::kStepPos] = p0 + t;
+        float *d_k = dev<float>(k.size()), *d_v = dev<float>(v.size());
+        int32_t* d_steps = dev<int32_t>(steps.size());
+        up(d_k, k); up(d_v, v); up(d_steps, steps);
+        int8_t *q0 = dev<int8_t>(codes), *q1 = dev<int8_t>(codes), *qv = dev<int8_t>(codes);
+        uint16_t *s0 = dev<uint16_t>(scales), *s1 = dev<uint16_t>(scales), *sv = dev<uint16_t>(scales);
+        for (void* x : {(void*) q0, (void*) q1, (void*) qv}) check(cudaMemset(x, 0, codes), "memset");
+        for (void* x : {(void*) s0, (void*) s1, (void*) sv}) check(cudaMemset(x, 0, scales * 2), "memset");
+        strata::kernels::kv_append_q8_steps(q0, qv, s0, sv, d_table, d_steps, strata::kernels::kStepCount, d_k, d_v,
+                                            n_tok, sh, s);
+        strata::kernels::kv_append_q8_steps(q1, nullptr, s1, nullptr, d_table, d_steps, strata::kernels::kStepCount,
+                                            d_k, d_v, n_tok, sh, s, 1);
+        check(cudaStreamSynchronize(s), "k8 append");
+        if (down(q0, codes) != down(q1, codes) || down(s0, scales) != down(s1, scales)) {
+            std::fprintf(stderr, "kv_q4: the INT8 append of K alone differs from both sides' K\n");
+            ++bad;
+        }
+        for (void* x : {(void*) d_k, (void*) d_v, (void*) d_steps, (void*) q0, (void*) q1, (void*) qv, (void*) s0,
+                        (void*) s1, (void*) sv})
+            cudaFree(x);
+    }
+    for (int f = 0; f < 2; ++f)
+        for (int kv = 0; kv < 2; ++kv) {
+            cudaFree(d_c[f][kv]);
+            cudaFree(d_s[f][kv]);
+        }
+    cudaFree(d_table);
+    std::printf("kv_q4: %s\n", bad ? "MISMATCH" : "the appends bitwise the host's rotation and rounding (1-37 tokens, "
+                                                  "both forms), the INT8 append of K alone bitwise both sides'");
+    return bad;
+}
+
 // ---- the indexer append: one call per token  vs  native_qsa_indexer_append_multi (blocks completed inside the
 // window, the first cell, and rejected tokens' -1 positions)
 int test_indexer_append(std::mt19937& rng, cudaStream_t s) {
@@ -1049,7 +1182,8 @@ int test_ple_tokens(std::mt19937& rng, cudaStream_t s) {
     return bad;
 }
 
-// ---- the decode attention (split, merged, gated)  vs  the prompt path's kernels (INT8 and FP16 pools; 1-2051 cells)
+// ---- the decode attention (split, merged, gated)  vs  the prompt path's kernels, and both against FP64 (FP16, INT8,
+// k8v4 and q4_0 pools; 1-2051 cells)
 int test_decode_attn(std::mt19937& rng, cudaStream_t s) {
     const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
     const int HD = (int) sh.head_dim, NH = (int) sh.n_head, NKV = (int) sh.n_head_kv;
@@ -1079,6 +1213,17 @@ int test_decode_attn(std::mt19937& rng, cudaStream_t s) {
     uint16_t *d_ks = dev<uint16_t>(n_scales), *d_vs = dev<uint16_t>(n_scales), *d_kh = dev<uint16_t>(n_codes),
              *d_vh = dev<uint16_t>(n_codes);
     up(d_kq, kq); up(d_vq, vq); up(d_ks, ks); up(d_vs, vs); up(d_kh, kh); up(d_vh, vh);
+    // 4-bit pools: any code bytes, a scale per 32 values
+    const size_t n_q4 = n_codes / 2, n_s4 = n_codes / strata::kernels::KV_Q4_GROUP;
+    std::vector<uint8_t> kq4(n_q4), vq4(n_q4);
+    for (auto* v : {&kq4, &vq4})
+        for (auto& c : *v) c = (uint8_t) (rng() & 0xFF);
+    std::vector<uint16_t> ks4(n_s4), vs4(n_s4);
+    for (auto& x : ks4) x = (uint16_t) (half_bits(0.01f, 0.3f) | ((rng() & 1u) << 15));   // either sign, as appended
+    for (auto& x : vs4) x = (uint16_t) (half_bits(0.01f, 0.3f) | ((rng() & 1u) << 15));
+    uint8_t *d_kq4 = dev<uint8_t>(n_q4), *d_vq4 = dev<uint8_t>(n_q4);
+    uint16_t *d_ks4 = dev<uint16_t>(n_s4), *d_vs4 = dev<uint16_t>(n_s4);
+    up(d_kq4, kq4); up(d_vq4, vq4); up(d_ks4, ks4); up(d_vs4, vs4);
     const std::vector<int> widths = {1, 5, 64, 65, 700, 2051};
     const int n_q = (int) widths.size();
     std::vector<int32_t> ids((size_t) n_q * cap, 0), steps((size_t) n_q * strata::kernels::kStepCount, 0);
@@ -1101,12 +1246,31 @@ int test_decode_attn(std::mt19937& rng, cudaStream_t s) {
     up(d_ids, ids); up(d_steps, steps); up(d_q, q); up(d_qf, qf);
     check(cudaDeviceSynchronize(), "attn inputs");
     const int64_t SC = strata::kernels::kStepCount;
-    int bad = 0, gate_bad = 0;
-    double worst = 0.0;
-    for (int int8 = 0; int8 < 2; ++int8) {
+    int bad = 0, gate_bad = 0, ref_bad = 0;
+    double worst = 0.0, worst_ref = 0.0;
+    static const char* const kNames[4] = {"FP16", "INT8", "k8v4", "q4_0"};
+    // a pool row's 256 values of side kv (0 K, 1 V) in format fmt, as stored (rotated on a 4-bit side)
+    auto row_values = [&](int fmt, int kv, size_t row, double* out) {
+        const bool q4 = fmt == 3 || (fmt == 2 && kv == 1);
+        for (int d = 0; d < HD; ++d) {
+            if (fmt == 0) out[d] = strata::kernels::f32_from_f16((kv ? vh : kh)[row * HD + d]);
+            else if (!q4)
+                out[d] = (double) (kv ? vq : kq)[row * HD + d] *
+                         strata::kernels::f32_from_f16((kv ? vs : ks)[row * (HD / 64) + d / 64]);
+            else {
+                const uint8_t b = (kv ? vq4 : kq4)[row * (HD / 2) + (d / 32) * 16 + d % 16];
+                const int code = (d % 32) < 16 ? (b & 15) : (b >> 4);
+                out[d] = (double) (code - 8) * strata::kernels::f32_from_f16((kv ? vs4 : ks4)[row * (HD / 32) + d / 32]);
+            }
+        }
+    };
+    for (int fmt = 0; fmt < 4; ++fmt) {
+        const char* name = kNames[fmt];
         strata::kernels::QsaAttnPools pools;
         pools.page_table = d_table;
-        if (int8) { pools.k_q = d_kq; pools.v_q = d_vq; pools.k_scale = d_ks; pools.v_scale = d_vs; }
+        if (fmt == 1) { pools.k_q = d_kq; pools.v_q = d_vq; pools.k_scale = d_ks; pools.v_scale = d_vs; }
+        else if (fmt == 2) { pools.k_q = d_kq; pools.k_scale = d_ks; pools.v_q4 = d_vq4; pools.v_q4s = d_vs4; }
+        else if (fmt == 3) { pools.k_q4 = d_kq4; pools.k_q4s = d_ks4; pools.v_q4 = d_vq4; pools.v_q4s = d_vs4; }
         else { pools.k_pool = d_kh; pools.v_pool = d_vh; }
         strata::kernels::qsa_prefill_attn(d_q, pools, d_ids, d_steps, cap, sh, d_b, n_q, s);
         for (int alone = 0; alone < 2; ++alone) {   // the queries in one call, and each alone (the most splits)
@@ -1129,10 +1293,59 @@ int test_decode_attn(std::mt19937& rng, cudaStream_t s) {
                 if (!(rel <= 2e-5)) {
                     if (bad < 5)
                         std::fprintf(stderr, "decode attn: %s pools, %s, query %d head %d: relative difference %.3g\n",
-                                     int8 ? "INT8" : "FP16", alone ? "alone" : "batched", r / NH, r % NH, rel);
+                                     name, alone ? "alone" : "batched", r / NH, r % NH, rel);
                     ++bad;
                 }
             }
+        }
+        // the prompt path's output against FP64 from the stored values (rotated queries and output on 4-bit sides)
+        {
+            const std::vector<float> b = down(d_b, q.size());
+            std::vector<double> kr((size_t) HD), vr((size_t) HD), qd((size_t) HD), acc((size_t) HD), sc;
+            for (int i = 0; i < n_q; ++i)
+                for (int h = 0; h < NH; ++h) {
+                    const int kvh = h / (NH / NKV), w = widths[(size_t) i];
+                    for (int d = 0; d < HD; ++d) qd[(size_t) d] = q[((size_t) i * NH + h) * HD + d];
+                    if (fmt == 3) fwht256_host(qd.data());
+                    sc.assign((size_t) w, 0.0);
+                    double mx = -1e300;
+                    for (int c = 0; c < w; ++c) {
+                        const int id = ids[(size_t) i * cap + c];
+                        const size_t row = ((size_t) table[(size_t) (id / sh.page_size)] * NKV + kvh) * sh.page_size +
+                                           id % sh.page_size;
+                        row_values(fmt, 0, row, kr.data());
+                        double dot = 0.0;
+                        for (int d = 0; d < HD; ++d) dot += qd[(size_t) d] * kr[(size_t) d];
+                        sc[(size_t) c] = dot / 16.0;
+                        mx = std::max(mx, sc[(size_t) c]);
+                    }
+                    std::fill(acc.begin(), acc.end(), 0.0);
+                    double l = 0.0;
+                    for (int c = 0; c < w; ++c) {
+                        const int id = ids[(size_t) i * cap + c];
+                        const size_t row = ((size_t) table[(size_t) (id / sh.page_size)] * NKV + kvh) * sh.page_size +
+                                           id % sh.page_size;
+                        row_values(fmt, 1, row, vr.data());
+                        const double pc = std::exp(sc[(size_t) c] - mx);
+                        l += pc;
+                        for (int d = 0; d < HD; ++d) acc[(size_t) d] += pc * vr[(size_t) d];
+                    }
+                    for (auto& x : acc) x /= l;
+                    if (fmt >= 2) fwht256_host(acc.data());
+                    double big = 0.0, diff = 0.0;
+                    for (int d = 0; d < HD; ++d) {
+                        big = std::max(big, std::fabs(acc[(size_t) d]));
+                        diff = std::max(diff, std::fabs(acc[(size_t) d] - b[((size_t) i * NH + h) * HD + d]));
+                    }
+                    const double rel = diff / std::max(big, 1e-30);
+                    worst_ref = std::max(worst_ref, rel);
+                    if (!(rel <= 1e-4)) {
+                        if (ref_bad < 5)
+                            std::fprintf(stderr, "attn vs FP64: %s pools, query %d head %d: relative difference %.3g\n",
+                                         name, i, h, rel);
+                        ++ref_bad;
+                    }
+                }
         }
         // the gate in the merge against native_qsa_gate_apply on the ungated output
         strata::kernels::qsa_decode_attn_batch(d_q, pools, d_ids, d_steps, cap, sh, d_scratch, d_a, n_q, s);
@@ -1141,20 +1354,128 @@ int test_decode_attn(std::mt19937& rng, cudaStream_t s) {
         check(cudaStreamSynchronize(s), "gated attn");
         const std::vector<float> g = down(d_g, q.size()), c = down(d_c, q.size());
         if (std::memcmp(g.data(), c.data(), g.size() * 4) != 0) {
-            std::fprintf(stderr, "decode attn: %s pools, the fused gate differs from native_qsa_gate_apply\n",
-                         int8 ? "INT8" : "FP16");
+            std::fprintf(stderr, "decode attn: %s pools, the fused gate differs from native_qsa_gate_apply\n", name);
             ++gate_bad;
         }
     }
     for (void* p : {(void*) d_table, (void*) d_kq, (void*) d_vq, (void*) d_ks, (void*) d_vs, (void*) d_kh, (void*) d_vh,
-                    (void*) d_ids, (void*) d_steps, (void*) d_q, (void*) d_a, (void*) d_b, (void*) d_qf, (void*) d_g,
-                    (void*) d_c, (void*) d_scratch})
+                    (void*) d_kq4, (void*) d_vq4, (void*) d_ks4, (void*) d_vs4, (void*) d_ids, (void*) d_steps,
+                    (void*) d_q, (void*) d_a, (void*) d_b, (void*) d_qf, (void*) d_g, (void*) d_c, (void*) d_scratch})
         cudaFree(p);
-    std::printf("decode_attn: %s, the gate %s (INT8 and FP16 pools, 1-2051 cells, 6 queries at once and each alone; "
-                "largest relative difference %.2g)\n",
+    std::printf("decode_attn: %s, the gate %s, %s (FP16, INT8, k8v4 and q4_0 pools, 1-2051 cells, 6 queries at once "
+                "and each alone; largest relative differences %.2g, %.2g from FP64)\n",
                 bad ? "OUTSIDE TOLERANCE" : "within 2e-5 of the prompt path's kernels",
-                gate_bad ? "DIFFERS" : "bitwise native_qsa_gate_apply's", worst);
-    return bad + gate_bad;
+                gate_bad ? "DIFFERS" : "bitwise native_qsa_gate_apply's",
+                ref_bad ? "FP64 OUTSIDE 1e-4" : "within 1e-4 of FP64", worst, worst_ref);
+    return bad + gate_bad + ref_bad;
+}
+
+// ---- K and V appended in each format, then both attention forms, against FP64 attention over the unquantized values:
+// the formats' own rounding is all that is left (each format's error, and INT8's for scale)
+int test_kv_roundtrip(std::mt19937& rng, cudaStream_t s) {
+    const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+    const int HD = (int) sh.head_dim, NH = (int) sh.n_head, NKV = (int) sh.n_head_kv, cells = 2048;
+    const int pages = cells / (int) sh.page_size, per_tok = NKV * HD;
+    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, sh);
+    const size_t rows = (size_t) cells * NKV;
+    std::vector<int32_t> table((size_t) pages);
+    for (int i = 0; i < pages; ++i) table[(size_t) i] = i;
+    int32_t* d_table = dev<int32_t>(table.size());
+    up(d_table, table);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> k((size_t) cells * per_tok), v((size_t) cells * per_tok);
+    for (size_t i = 0; i < k.size(); ++i) {   // a few outlier channels, as real keys have
+        const int d = (int) (i % HD);
+        k[i] = nd(rng) * (d % 37 == 0 ? 8.0f : 1.0f);
+        v[i] = nd(rng);
+    }
+    float *d_k = dev<float>(k.size()), *d_v = dev<float>(v.size());
+    up(d_k, k); up(d_v, v);
+    int8_t *d_kq = dev<int8_t>(rows * HD), *d_vq = dev<int8_t>(rows * HD);
+    uint16_t *d_ks = dev<uint16_t>(rows * 4), *d_vs = dev<uint16_t>(rows * 4);
+    uint8_t *d_kq4 = dev<uint8_t>(rows * 128), *d_vq4 = dev<uint8_t>(rows * 128);
+    uint16_t *d_ks4 = dev<uint16_t>(rows * 8), *d_vs4 = dev<uint16_t>(rows * 8);
+    const int n_q = 3;
+    const int widths[n_q] = {1, 300, 2048};
+    std::vector<int32_t> ids((size_t) n_q * cap, 0), steps((size_t) n_q * strata::kernels::kStepCount, 0);
+    for (int i = 0; i < n_q; ++i) {
+        for (int c = 0; c < widths[i]; ++c) ids[(size_t) i * cap + c] = cells - widths[i] + c;
+        steps[(size_t) i * strata::kernels::kStepCount + strata::kernels::kStepWidth] = widths[i];
+    }
+    std::vector<float> q((size_t) n_q * NH * HD);
+    for (auto& x : q) x = 0.3f * nd(rng);
+    int32_t *d_ids = dev<int32_t>(ids.size()), *d_steps = dev<int32_t>(steps.size());
+    float *d_q = dev<float>(q.size()), *d_a = dev<float>(q.size()), *d_b = dev<float>(q.size());
+    float* d_scratch = dev<float>((size_t) n_q * strata::kernels::qsa_decode_attn_scratch_floats(cap, sh));
+    up(d_ids, ids); up(d_steps, steps); up(d_q, q);
+    // FP64 over the values as appended
+    std::vector<double> ref(q.size());
+    for (int i = 0; i < n_q; ++i)
+        for (int h = 0; h < NH; ++h) {
+            const int kvh = h / (NH / NKV), w = widths[i];
+            std::vector<double> sc((size_t) w);
+            double mx = -1e300;
+            for (int c = 0; c < w; ++c) {
+                const int id = ids[(size_t) i * cap + c];
+                double dot = 0.0;
+                for (int d = 0; d < HD; ++d)
+                    dot += (double) q[((size_t) i * NH + h) * HD + d] * k[(size_t) id * per_tok + kvh * HD + d];
+                sc[(size_t) c] = dot / 16.0;
+                mx = std::max(mx, sc[(size_t) c]);
+            }
+            double l = 0.0;
+            for (int c = 0; c < w; ++c) l += std::exp(sc[(size_t) c] - mx);
+            for (int d = 0; d < HD; ++d) {
+                double a = 0.0;
+                for (int c = 0; c < w; ++c)
+                    a += std::exp(sc[(size_t) c] - mx) * v[(size_t) ids[(size_t) i * cap + c] * per_tok + kvh * HD + d];
+                ref[((size_t) i * NH + h) * HD + d] = a / l;
+            }
+        }
+    static const char* const kNames[3] = {"INT8", "k8v4", "q4_0"};
+    double err[3][2] = {};
+    int bad = 0;
+    for (int fmt = 0; fmt < 3; ++fmt) {
+        strata::kernels::QsaAttnPools pools;
+        pools.page_table = d_table;
+        if (fmt == 0) {
+            strata::prefill::kv_append(d_k, d_v, cells, 0, d_table, sh.page_size, nullptr, nullptr, d_kq, d_vq, d_ks,
+                                       d_vs, s);
+            pools.k_q = d_kq; pools.v_q = d_vq; pools.k_scale = d_ks; pools.v_scale = d_vs;
+        } else if (fmt == 1) {
+            strata::prefill::kv_append(d_k, d_v, cells, 0, d_table, sh.page_size, nullptr, nullptr, d_kq, nullptr, d_ks,
+                                       nullptr, s, 1);
+            strata::kernels::kv_append_q4_rows(nullptr, nullptr, d_vq4, d_vs4, d_table, 0, cells, d_k, d_v, per_tok, sh, s);
+            pools.k_q = d_kq; pools.k_scale = d_ks; pools.v_q4 = d_vq4; pools.v_q4s = d_vs4;
+        } else {
+            strata::kernels::kv_append_q4_rows(d_kq4, d_ks4, d_vq4, d_vs4, d_table, 0, cells, d_k, d_v, per_tok, sh, s);
+            pools.k_q4 = d_kq4; pools.k_q4s = d_ks4; pools.v_q4 = d_vq4; pools.v_q4s = d_vs4;
+        }
+        strata::kernels::qsa_prefill_attn(d_q, pools, d_ids, d_steps, cap, sh, d_b, n_q, s);
+        strata::kernels::qsa_decode_attn_batch(d_q, pools, d_ids, d_steps, cap, sh, d_scratch, d_a, n_q, s);
+        check(cudaStreamSynchronize(s), "roundtrip attn");
+        const std::vector<float> a = down(d_a, q.size()), b = down(d_b, q.size());
+        for (int form = 0; form < 2; ++form) {   // RMS error over RMS of the reference
+            const std::vector<float>& x = form ? a : b;
+            double e2 = 0.0, r2 = 0.0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                e2 += (x[i] - ref[i]) * (x[i] - ref[i]);
+                r2 += ref[i] * ref[i];
+            }
+            err[fmt][form] = std::sqrt(e2 / r2);
+        }
+        // 4-bit V keeps a few percent; INT8 well under one; anything above 15% is not rounding
+        if (!(err[fmt][0] < 0.15 && err[fmt][1] < 0.15)) ++bad;
+    }
+    for (void* x : {(void*) d_table, (void*) d_k, (void*) d_v, (void*) d_kq, (void*) d_vq, (void*) d_ks, (void*) d_vs,
+                    (void*) d_kq4, (void*) d_vq4, (void*) d_ks4, (void*) d_vs4, (void*) d_ids, (void*) d_steps,
+                    (void*) d_q, (void*) d_a, (void*) d_b, (void*) d_scratch})
+        cudaFree(x);
+    std::printf("kv_roundtrip: %s (RMS error of the output against FP64 over the unquantized K and V, prompt / decode "
+                "form: %s %.3g / %.3g, %s %.3g / %.3g, %s %.3g / %.3g)\n",
+                bad ? "OUTSIDE 15%" : "the formats' rounding only", kNames[0], err[0][0], err[0][1], kNames[1],
+                err[1][0], err[1][1], kNames[2], err[2][0], err[2][1]);
+    return bad;
 }
 
 // ---- the prompt path's GDN conv and recurrence over a chunk  vs  the verify window's kernels, 8 tokens at a time
@@ -1317,9 +1638,11 @@ int main(int argc, char** argv) {
     bad += test_rope_tokens(rng, s);
     bad += test_norm_rope(rng, s);
     bad += test_kv_append(rng, s);
+    bad += test_kv_q4(rng, s);
     bad += test_indexer_append(rng, s);
     bad += test_ple_tokens(rng, s);
     bad += test_decode_attn(rng, s);
+    bad += test_kv_roundtrip(rng, s);
     bad += test_prefill_gdn(rng, s);
     bad += test_argmax(rng, s);
     cudaStreamDestroy(s);
