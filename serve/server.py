@@ -28,6 +28,7 @@ import hmac
 import codecs
 import ctypes
 import json
+import math
 import os
 import queue
 import signal
@@ -323,6 +324,9 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        score = sampling.get("score")   # candidate ids -> the engine's `LP` line (POST /v1/choose)
+        if score:
+            keys += " score=" + ":".join(str(int(t)) for t in score)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -370,6 +374,8 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     yield int(line[2:])
+                elif line.startswith("LP "):     # score=: the candidates' log-probabilities after the prompt
+                    self.last_scores = {int(k): float(v) for k, v in (f.split(":") for f in line.split()[1:])}
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -955,6 +961,47 @@ class Service:
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def choose(self, req: dict) -> dict:
+        """POST /v1/choose: one decision in one forward pass, nothing generated.  The chat is rendered as
+        /v1/chat/completions renders it (thinking off), `answer_prefix` is appended after the assistant header, and the
+        engine reads the log-probability of each option's single token there (classify, route, pick a letter).
+        -> {"probs": {option: p} renormalized over the options, "logprobs", "mass" (the probability the options got of
+        everything the model could have said: a low mass means it wanted to say something else), "choice",
+        "confidence", "prompt_tokens", "reused", "seconds"}"""
+        options = req.get("options") or []
+        if not options or not all(isinstance(o, str) and o for o in options):
+            raise ValueError("choose: `options` must be a non-empty list of strings")
+        messages, _, kw = openai_to_messages(req)
+        kw = dict(kw, enable_thinking=False)
+        prompt = self.template.render(messages, tools=None, **kw) + str(req.get("answer_prefix") or "")
+        ids = self.tok.encode(prompt, parse_special=True)
+        cand = []
+        for o in options:
+            t = self.tok.encode(o, parse_special=False)
+            if len(t) != 1:
+                raise ValueError(f"choose: option {o!r} is {len(t)} tokens; options must be single tokens (A, B, ...)")
+            cand.append(int(t[0]))
+        if len(ids) + 2 > self.engine.max_context - CTX_SLACK:
+            raise ValueError(f"choose: the prompt ({len(ids)} tokens) does not fit the context")
+        t0 = time.time()
+        with self.fifo:
+            self.engine.last_scores = None
+            for _ in self.engine.generate(ids, 1, {"score": cand}, threading.Event()):
+                pass
+            lp = getattr(self.engine, "last_scores", None) or {}
+        if len(lp) != len(set(cand)):
+            raise ValueError("choose: the engine could not read the logits row (a split output head keeps no whole rows)")
+        logprobs = {o: lp[c] for o, c in zip(options, cand)}
+        mx = max(logprobs.values())
+        ex = {o: math.exp(v - mx) for o, v in logprobs.items()}
+        total = sum(ex.values())
+        probs = {o: ex[o] / total for o in options}
+        choice = max(probs, key=probs.get)
+        last = getattr(self.engine, "last", {}) or {}
+        return {"probs": probs, "logprobs": logprobs, "mass": sum(math.exp(v) for v in logprobs.values()),
+                "choice": choice, "confidence": probs[choice], "prompt_tokens": len(ids),
+                "reused": last.get("reused"), "seconds": round(time.time() - t0, 3)}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1568,6 +1615,8 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/choose":
+                    self._json(200, svc.choose(req))
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:

@@ -377,6 +377,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
+| A choice among single-token options in one forward pass, nothing generated ([below](#one-pass-choices)) | `POST /v1/choose` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
@@ -389,6 +390,28 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "strata", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'
 ```
+
+### One-pass choices
+
+`POST /v1/choose` answers a multiple-choice question without generating: the chat is rendered as for
+`/v1/chat/completions` (thinking off), `answer_prefix` (optional) is appended after the assistant header, and the engine
+reads the probability of each option's token from the first window's logits. Options must be single tokens (letters
+are). It suits classifiers and routers in agent loops: a decision costs one prompt read, and the probabilities double as
+a confidence to act on or to fall back from.
+
+```bash
+curl http://127.0.0.1:8080/v1/choose -H "Content-Type: application/json" -d '{
+  "messages": [{"role": "user", "content": "Is Paris the capital of France? A) yes B) no. Answer with the letter."}],
+  "options": ["A", "B"] }'
+# {"probs": {"A": 0.9997, "B": 0.0003}, "logprobs": {...}, "mass": 0.9986, "choice": "A", "confidence": 0.9997,
+#  "prompt_tokens": 33, "reused": 0, "seconds": 0.92}
+```
+
+`probs` are renormalized over the options; `mass` is the probability the options got out of everything the model could
+have said there (low: it wanted to answer something else, and the choice means little). Through the engine's own
+protocol the same is a `score=ID:ID:...` key on `GEN`, which prints `LP id:logprob ...` before the first `T`. With the
+output head split across two GPUs the whole logits rows are not kept, and the request returns an error instead of a
+partial distribution.
 
 ```python
 from openai import OpenAI
@@ -414,6 +437,9 @@ print(r.choices[0].message.content)
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
+- **Requests without tools.** Tool calls are taken out of the text only when the request declares tools. Without
+  them the answer is the model's text as written, `<tool_call>` tags included, for clients with their own text tool
+  protocol (OpenAI's API never returns `tool_calls` for a request without tools either).
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
 - **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
   `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
@@ -425,7 +451,10 @@ print(r.choices[0].message.content)
 - **Prompt cache.** A request continues from the longest start of its prompt the engine still holds, so the next turn
   of a chat or an agent processes only what is new (a 16K-token conversation: ~0.3 s instead of ~25 s before the first
   token). It keeps checkpoints of the sequence state in RAM (at every turn's start and end, and every 16K tokens of a
-  long prompt: regenerated and edited answers resume from them) and moves a conversation that another request replaces
+  long prompt: regenerated and edited answers resume from them; for agents also where a prompt leaves the previous
+  request's and just before its last message ends, so one long context asked different questions, or a transcript
+  growing inside one message, is read once: a 6K-token prompt's next request in ~0.5-1 s instead of ~10 s on an
+  RTX 3060) and moves a conversation that another request replaces
   (a chat app's title request, a subagent) to RAM with its key/value cache, so switching back continues where it was.
   Responses report the reused tokens (`usage.prompt_tokens_details.cached_tokens`; Anthropic:
   `cache_read_input_tokens`). Engine options: `--prompt-cache N` checkpoints (default 16, ~110 MB each; 0 = off),
