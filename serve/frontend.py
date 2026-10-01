@@ -284,6 +284,10 @@ class OutputParser:
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
+        # A request that declares no tools gets the model's text verbatim, tool-call tags included: clients with their
+        # own text tool protocol read `content` only, and an extracted call left them an empty reply (OpenAI's API
+        # never returns tool_calls for a request without tools either).
+        self.parse_tools = bool(tools)
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -433,6 +437,11 @@ class OutputParser:
                         self.buf = ""
                         return out
                     self.buf, self.lead = stripped, False
+                if not self.parse_tools:
+                    if self.buf:
+                        out.append(Event("content", self.buf))
+                        self.buf = ""
+                    return out
                 i = self.buf.find(CALL_START)
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
