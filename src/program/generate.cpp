@@ -2592,6 +2592,8 @@ int main(int argc, char** argv) {
         strata::spec::SuffixDrafter lookup(o.spec_lookup, 32, o.spec_lookup > 0 ? (size_t) o.max_context + 16 : 16);
         std::vector<int32_t> ids32, ldrafts((size_t) W, 0);
         constexpr int64_t kImStart = 248045;   // <|im_start|>: a new turn begins here
+        // The previous request's prompt: where a new one leaves it, it gets a checkpoint (see `fork` below).
+        std::vector<int64_t> prev_prompt;
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -2786,6 +2788,29 @@ int main(int argc, char** argv) {
             if (track)
                 for (int64_t i = n - 2; i > reuse; --i)
                     if (ids[(size_t) i] == kImStart) { q = i; break; }
+            // An agent sends one long prefix again and again with a different tail (a classifier's, a coder's, a
+            // critic's question after the same context; a transcript that grows inside one user message): none of
+            // the cuts above falls where those prompts part.  Two more checkpoints for them: where this prompt leaves
+            // the previous one (the next request sharing that prefix resumes there), and a few cells before the last
+            // message's <|im_end|> (a transcript appended to inside one message parts there on the very next request;
+            // the margin covers a seam that tokenizes differently once text follows it).
+            constexpr int64_t kImEnd = 248046;
+            int64_t fork = 0, msg_end = 0;
+            if (track) {
+                const int64_t lim = std::min<int64_t>((int64_t) prev_prompt.size(), n - 1);
+                int64_t d = 0;
+                while (d < lim && prev_prompt[(size_t) d] == ids[(size_t) d]) ++d;
+                if (d > reuse + 256 && d < n - 1 && d != q) fork = d;
+                for (int64_t i = (q > 0 ? q : n - 1) - 1; i > reuse; --i)
+                    if (ids[(size_t) i] == kImEnd) {
+                        if (i - 4 > reuse + 256 && i - 4 != fork) msg_end = i - 4;
+                        break;
+                    }
+            }
+            if (!geni) prev_prompt.assign(ids.begin(), ids.end());
+            const int64_t cut1 = std::min(fork > 0 ? fork : INT64_MAX, msg_end > 0 ? msg_end : INT64_MAX);
+            const int64_t cut2 = std::max(fork, msg_end) > cut1 ? std::max(fork, msg_end) : 0;
+            const int64_t cuts[2] = {cut1 == INT64_MAX ? 0 : cut1, cut2};   // ascending, 0 = none
             int64_t batched_end = reuse;   // [reuse, batched_end) through the batched prompt path
             if (geni) batched_end = n - 1;   // image rows reach the batched path only
             else if (n - 1 - reuse > o.feed_max) batched_end = (q > reuse && n - 1 - q <= o.feed_max) ? q : n - 1;
@@ -2795,6 +2820,8 @@ int main(int argc, char** argv) {
             if (!geni && batched_end > reuse) {
                 const int64_t last = reuse + (batched_end - 1 - reuse) / o.prefill_chunk * o.prefill_chunk;
                 if (last > reuse && batched_end - last <= o.feed_max) batched_end = last;
+                for (int64_t c : cuts)   // a short piece after a cut goes through verify windows, as a short last chunk
+                    if (c > reuse && c < batched_end && batched_end - c <= o.feed_max) { batched_end = c; break; }
             }
             if (batched_end > reuse) {
                 tier.apply_pending(true);   // no copy may still land in a lent slot
@@ -2805,7 +2832,9 @@ int main(int argc, char** argv) {
                 pp_total = n - 1 - reuse;
                 pp_t0 = r0;
                 for (int64_t a0 = reuse; a0 < batched_end;) {
-                    const int64_t b0 = track ? std::min(batched_end, a0 + step) : batched_end;
+                    int64_t b0 = track ? std::min(batched_end, a0 + step) : batched_end;
+                    for (int64_t c : cuts)
+                        if (c > a0 && c < b0) { b0 = c; break; }
                     pp_at = a0;
                     if (!prefill.run(ids.data() + a0, b0 - a0, a0, err)) {
                         if (!stop_req.load()) { report(err); return 1; }
@@ -2862,11 +2891,20 @@ int main(int argc, char** argv) {
                     pp_total = n - 1 - reuse;
                     pp_t0 = r0;
                 }
+                auto feed_to = [&](int64_t from, int64_t to) -> bool {   // with the `cuts` checkpoints on the way
+                    for (int64_t c : cuts)
+                        if (track && c > from && c < to) {
+                            if (!feed(from, c)) return false;
+                            pcache.checkpoint(c);
+                            from = c;
+                        }
+                    return feed(from, to);
+                };
                 const int64_t split = q > batched_end ? q : batched_end;
-                if (!feed(batched_end, split)) { report(err); return 1; }
+                if (!feed_to(batched_end, split)) { report(err); return 1; }
                 if (split > batched_end) pp_line(split);
                 if (track && split == q) pcache.checkpoint(q);
-                if (!feed(split, n - 1)) { report(err); return 1; }
+                if (!feed_to(split, n - 1)) { report(err); return 1; }
                 if (n - 1 > split) pp_line(n - 1);
                 if (track) pcache.checkpoint(n - 1);
             }

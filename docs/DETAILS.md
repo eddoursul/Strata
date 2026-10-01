@@ -404,7 +404,10 @@ print(r.choices[0].message.content)
 - **Prompt cache.** A request continues from the longest start of its prompt the engine still holds, so the next turn
   of a chat or an agent processes only what is new (a 16K-token conversation: ~0.3 s instead of ~25 s before the first
   token). It keeps checkpoints of the sequence state in RAM (at every turn's start and end, and every 16K tokens of a
-  long prompt: regenerated and edited answers resume from them) and moves a conversation that another request replaces
+  long prompt: regenerated and edited answers resume from them; for agents also where a prompt leaves the previous
+  request's and just before its last message ends, so one long context asked different questions, or a transcript
+  growing inside one message, is read once: a 6K-token prompt's next request in ~0.5-1 s instead of ~10 s on an
+  RTX 3060) and moves a conversation that another request replaces
   (a chat app's title request, a subagent) to RAM with its key/value cache, so switching back continues where it was.
   Responses report the reused tokens (`usage.prompt_tokens_details.cached_tokens`; Anthropic:
   `cache_read_input_tokens`). Engine options: `--prompt-cache N` checkpoints (default 16, ~110 MB each; 0 = off),
