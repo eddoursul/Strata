@@ -330,6 +330,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
+| A choice among single-token options in one forward pass, nothing generated ([below](#one-pass-choices)) | `POST /v1/choose` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
@@ -342,6 +343,28 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "strata", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'
 ```
+
+### One-pass choices
+
+`POST /v1/choose` answers a multiple-choice question without generating: the chat is rendered as for
+`/v1/chat/completions` (thinking off), `answer_prefix` (optional) is appended after the assistant header, and the engine
+reads the probability of each option's token from the first window's logits. Options must be single tokens (letters
+are). It suits classifiers and routers in agent loops: a decision costs one prompt read, and the probabilities double as
+a confidence to act on or to fall back from.
+
+```bash
+curl http://127.0.0.1:8080/v1/choose -H "Content-Type: application/json" -d '{
+  "messages": [{"role": "user", "content": "Is Paris the capital of France? A) yes B) no. Answer with the letter."}],
+  "options": ["A", "B"] }'
+# {"probs": {"A": 0.9997, "B": 0.0003}, "logprobs": {...}, "mass": 0.9986, "choice": "A", "confidence": 0.9997,
+#  "prompt_tokens": 33, "reused": 0, "seconds": 0.92}
+```
+
+`probs` are renormalized over the options; `mass` is the probability the options got out of everything the model could
+have said there (low: it wanted to answer something else, and the choice means little). Through the engine's own
+protocol the same is a `score=ID:ID:...` key on `GEN`, which prints `LP id:logprob ...` before the first `T`. With the
+output head split across two GPUs the whole logits rows are not kept, and the request returns an error instead of a
+partial distribution.
 
 ```python
 from openai import OpenAI

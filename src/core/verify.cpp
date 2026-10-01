@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1358,6 +1359,24 @@ bool Verifier::copy_logits(int T, float* out, std::string& err) const {
         cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("verify: reading the logits back: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    }
+    return true;
+}
+
+bool Verifier::candidate_logprobs(const int32_t* cand, int n, float* out, std::string& err) const {
+    std::vector<float> row((size_t) n_vocab_);
+    if (!copy_logits(1, row.data(), err)) return false;
+    float mx = -INFINITY;
+    for (float v : row)
+        if (std::isfinite(v) && v > mx) mx = v;
+    double sum = 0.0;
+    for (float v : row)
+        if (std::isfinite(v)) sum += std::exp((double) v - mx);
+    const double lse = (double) mx + std::log(sum);
+    for (int i = 0; i < n; ++i) {
+        const int32_t id = cand[i];
+        const bool ok = id >= 0 && id < n_vocab_ && std::isfinite(row[(size_t) id]);
+        out[i] = ok ? (float) ((double) row[(size_t) id] - lse) : -INFINITY;
     }
     return true;
 }
