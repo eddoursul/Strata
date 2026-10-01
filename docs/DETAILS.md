@@ -70,6 +70,20 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It does not stream its KV cache (KV streaming is on by default from 64K), so it pays off mostly on large
 cards at long contexts.
 
+**Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
+expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
+slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt
+at temperature 0 can end in a different (equally good) answer when the drafting, the cache state or a resumed
+conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
+every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
+-1..-3%, the other models the same; the default stays the fastest rule.
+
+**The draft layer's tokens (`--draft-vocab`):** the MTP draft layer can only propose tokens from a subset of the
+vocabulary (`mtp/rt/draft_vocab.bin`). This fork keeps the English/code subset (40,525 ids, `data/draft_vocab.bin`,
+the same file as upstream's `--draft-vocab en`). Upstream's default since 0.1.27 adds every Chinese, Japanese and
+Korean token (106,299 ids): answers in those languages 15-38% faster, English answers 1-2% slower, and its head takes
+~110 MiB more VRAM. `tools/draft_vocab.py` builds and inspects subsets.
+
 **Low-RAM mode (engine 0.1.26, chosen by setup):** normally all of a model's experts are copied into RAM (23-50 GB,
 pinned) and the GPU holds a copy of the most-used ones. On a PC whose RAM cannot hold them beside the system (the
 experts plus ~10 GB), setup instead maps them from one file in the model's folder (`--mmap-experts`, the pack's
@@ -319,6 +333,27 @@ Terminal chat: `.venv/bin/python chat.py`.
 - **WSL** works (Ubuntu 24.04 tested), with one limit: the NVIDIA driver pins only about 1 GB of RAM there, so KV
   streaming (`--kv-resident`) is off and the KV cache stays in VRAM, and the experts are copied to the GPU from
   unpinned RAM (slower prompts than native Linux).
+
+---
+
+## Sharing the GPU with other programs (optional)
+
+By default the model stays loaded until you close Strata. On a PC that also games, renders or runs another model
+server, three server options (all off by default; also as keys in `strata-<model>.json`) give the VRAM back:
+
+| Option | Config key | What it does |
+| --- | --- | --- |
+| `--idle-unload 600` | `"idle_unload_s": 600` | unload the model after 600 s without requests; the next request loads it again |
+| `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | load an unloaded model only when that much VRAM is free (it waits up to 15 s for memory being given back), else answer **503** "the GPU is in use by another program" instead of starting into what a game left (with several GPUs it checks the first one: the config's first `"gpu"`, or the engine's `--main-gpu`) |
+| `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | a command run before the model is loaded again, e.g. one that unloads another server's model |
+
+`POST /unload` unloads it now (`409` while a request is running) and `POST /load` loads it ahead of a request;
+`/health` says `"loaded"`, `/v1/models` lists it as `unloaded` (like llama.cpp's router), `/props` sets
+`is_sleeping` and the Monitor shows the state. Unloading ends the engine process - and the image encoder, when images
+are on; it is started again first, as at a start - so their VRAM and RAM go straight back. The model files stay in
+the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere. Measured on an RTX 5060 Ti
+16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
+4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
 ---
 

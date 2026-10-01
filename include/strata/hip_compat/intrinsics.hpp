@@ -1,6 +1,6 @@
 #pragma once
 
-// CUDA device intrinsics used by Strata kernels that HIP does not provide on gfx1100.
+// CUDA device intrinsics used by Strata kernels that HIP does not provide on RDNA3 / RDNA4 (wave32).
 // This header is included only from the HIP cuda_runtime compatibility shim.
 #if defined(__HIPCC__)
 
@@ -15,10 +15,11 @@ __device__ __forceinline__ int signed_byte(uint32_t word, int lane) {
 
 // CUDA's signed __dp4a: four signed byte products accumulated modulo 2^32.
 __device__ __forceinline__ int dp4a(int a, int b, int c) {
-#if defined(__gfx1100__) && __has_builtin(__builtin_amdgcn_sudot4)
-    // RDNA3 exposes the signed/unsigned dot4 form. Mark both packed operands
-    // signed to preserve CUDA __dp4a semantics; keep the portable path for
-    // other HIP compilers/targets.
+#if (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1200__) || \
+     defined(__gfx1201__)) && __has_builtin(__builtin_amdgcn_sudot4)
+    // RDNA3 and RDNA4 expose the signed/unsigned dot4 form (v_dot4_i32_iu8). Mark
+    // both packed operands signed to preserve CUDA __dp4a semantics; keep the
+    // portable path for other HIP compilers/targets.
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
     const uint32_t ua = static_cast<uint32_t>(a);

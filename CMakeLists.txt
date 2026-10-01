@@ -8,7 +8,7 @@
 # written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
 # binary that runs and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.27 LANGUAGES CXX)
+project(strata VERSION 0.1.30 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
@@ -54,6 +54,11 @@ if(STRATA_ENABLE_CUDA)
       message(FATAL_ERROR
         "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
+    endif()
+    # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
+    if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+      message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
+                      "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
     endif()
   endforeach()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
@@ -300,6 +305,12 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(sampler_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(sampler_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME sampler_parity COMMAND sampler_parity --selftest)
+  set_tests_properties(sampler_parity PROPERTIES ENVIRONMENT "STRATA_OLD_SAMPLER=0;STRATA_SAMPLER_ONE_BLOCK=0")
+  # the same fixtures on the other two sampled paths: the one-block kernel and the 0.1.20 kernel
+  add_test(NAME sampler_parity_one_block COMMAND sampler_parity --selftest)
+  set_tests_properties(sampler_parity_one_block PROPERTIES ENVIRONMENT "STRATA_OLD_SAMPLER=0;STRATA_SAMPLER_ONE_BLOCK=1")
+  add_test(NAME sampler_parity_old COMMAND sampler_parity --selftest)
+  set_tests_properties(sampler_parity_old PROPERTIES ENVIRONMENT "STRATA_OLD_SAMPLER=1;STRATA_SAMPLER_ONE_BLOCK=0")
 
   add_executable(rope_parity src/kernels/rope_parity.cpp)
   target_include_directories(rope_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -379,12 +390,19 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(mmvq_il_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME mmvq_il_parity COMMAND mmvq_il_parity)
 
+  # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
+  # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)
+  add_executable(mmvq_multi_parity src/kernels/mmvq_multi_parity.cpp)
+  target_include_directories(mmvq_multi_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(mmvq_multi_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
+
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
-  if(STRATA_BUILD_TESTS)
-  add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
-  target_include_directories(native_mmvq_multi PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(native_mmvq_multi PRIVATE strata_kernels CUDA::cudart)
-  add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp")
+    add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
+    target_include_directories(native_mmvq_multi PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(native_mmvq_multi PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
   endif()
 
   # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
@@ -449,6 +467,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(controller_test src/spec/controller_test.cpp)
   target_link_libraries(controller_test PRIVATE strata_spec)
   add_test(NAME controller_test COMMAND controller_test)
+  # the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
+  add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
+  target_include_directories(bf16_bits_test PRIVATE include)
+  add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
@@ -558,7 +580,7 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
 endif()
 
-if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
+if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
   add_executable(hit_cpu_order_parity bench/micro/hit_cpu_order_parity.cu)
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 endif()

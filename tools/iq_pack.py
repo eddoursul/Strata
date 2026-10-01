@@ -292,12 +292,15 @@ def main() -> int:
         blob = per[0] + per[1] + per[2]
         layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
         offset += blob * N_EXPERT
-    with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
+    # under a temporary name until every layer is in: setup takes an existing native_experts.txt as a finished pack
+    tmp = out / "native_experts.txt.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
         fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes (n_expert %d, total %d; the "
                  "engine takes the experts from %s by tensor name, or from experts.bin)\n"
                  % (N_EXPERT, offset, src.name))
         for l, gt, dt, off, blob, ts in layout:
             fo.write("%d %d %d %d %d\n" % (l, gt, dt, off, blob))
+    tmp.replace(out / "native_experts.txt")
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)

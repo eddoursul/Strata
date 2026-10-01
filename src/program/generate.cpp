@@ -453,6 +453,15 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
+/// A serve request that failed on a CUDA fault (an illegal address) leaves at once (#224): the fault poisons the
+/// context for the whole process, and the destructors run on it can hang until the server's watchdog.
+void exit_on_cuda_fault() {
+    if (cudaPeekAtLastError() == cudaSuccess) return;
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
 struct Drive {
     strata::core::ExpertDispatch d;
@@ -1227,6 +1236,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
     }
+    // a run starts from a zeroed state (#167): a native pack's prompt goes through the batched path and verify
+    // windows, which zero nothing, and the cudaMalloc'd state holds whatever the allocator last held
+    strata::core::session_zero(ss, g, nullptr, main_cs);
+    if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
+        return 1;
+    }
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
     // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
@@ -1493,6 +1509,9 @@ int main(int argc, char** argv) {
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
+        if (o.expert_cache == 0)   // the verify window cannot run without it (#174)
+            std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: lower --max-context or close "
+                                 "other programs that use the GPU\n");
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
@@ -1519,6 +1538,7 @@ int main(int argc, char** argv) {
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
         // page back while the verify graph spun on a host flag never finished.  So the slots are zeroed and the
         // free figure read again; while it is short of the reserve the cache is reopened smaller.
+        int zero_reads = 0;
         for (int attempt = 0;; ++attempt) {
             const bool ok = sized_slots.empty()
                 ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
@@ -1534,9 +1554,11 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
-            // short by (want - free); a figure of 0 only says "at least", so then give back a quarter as well
+            // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
+            // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
             int64_t give = want - (int64_t) free_b + (64ll << 20);
-            if (free_b < ((size_t) 16 << 20)) give = std::max<int64_t>(give, xcache.bytes() / 4);
+            if (free_b < ((size_t) 16 << 20))
+                give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
             const int64_t keep_bytes = xcache.bytes() - give;
             std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
                                  "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
@@ -2603,6 +2625,7 @@ int main(int argc, char** argv) {
         while (next_line(line)) {
             if (line == "QUIT") break;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            err.clear();             // and so is a stopped request's "cancelled"
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -2755,9 +2778,10 @@ int main(int argc, char** argv) {
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             const Clock::time_point r0 = Clock::now();
-            auto report = [&](const std::string& e) {
+            auto report = [&](const std::string& e) {   // a failed request: the engine exits after it
                 std::fprintf(stderr, "strata serve: %s\n", e.c_str());
                 std::printf("ERR %s\n", e.c_str());
+                exit_on_cuda_fault();
             };
             // ---- the prompt cache: continue from the longest prefix it holds (or start from an empty sequence).
             // Image requests are not cached: their cells are not identified by the token ids alone.
@@ -2922,14 +2946,14 @@ int main(int argc, char** argv) {
                 drive.flush_next = !drive.d.usage.empty() && ((rounds + 2) % o.adapt_every) == 0;
                 if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                     drive.join_adapt();
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    report(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     return 1;
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (!ver.commit(a + 1, err, false)) {   // beside the draft
                     drive.join_adapt();
-                    std::printf("ERR %s\n", err.c_str());
+                    report(err);
                     return 1;
                 }
                 if (track) pcache.set(p, window.data(), a + 1);   // the committed cells p .. p + a
@@ -2960,11 +2984,11 @@ int main(int argc, char** argv) {
                                       mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p)) &&
                                      ver.wait_commit(err);
                 if (!drive.join_adapt()) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    report("an adaptive refill failed");
                     return 1;
                 }
                 if (!drafted) {
-                    std::printf("ERR %s\n", err.c_str());
+                    report(err);
                     return 1;
                 }
                 if (eos) { finish = "stop"; break; }
