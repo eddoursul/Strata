@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace strata::core {
 namespace {
@@ -23,6 +26,7 @@ AdaptiveTier::~AdaptiveTier() {
     cudaEvent_t evs[] = {t0_, t1_};
     for (cudaEvent_t e : evs) if (e) cudaEventDestroy(e);
     if (stream_) cudaStreamDestroy(stream_);
+    if (stage_arena_ != nullptr) cudaFreeHost(stage_arena_);
 }
 
 bool AdaptiveTier::init(ExpertCache& cache, ExpertSource& src, std::vector<int32_t>& host_res, int64_t n_layers,
@@ -40,6 +44,15 @@ bool AdaptiveTier::init(ExpertCache& cache, ExpertSource& src, std::vector<int32
     bool ok = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) == cudaSuccess &&
               cudaEventCreate(&t0_) == cudaSuccess && cudaEventCreate(&t1_) == cudaSuccess;
     for (cudaEvent_t& e : evs_) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+    batch_stage_.resize(kBatches);
+    if (cudaHostAlloc((void**) &stage_arena_, kStageBlocks * kStageBlock, cudaHostAllocDefault) == cudaSuccess) {
+        for (size_t i = 0; i < kStageBlocks; ++i) stage_free_.push_back(i);
+    } else {
+        cudaGetLastError();   // fall back to copying pageable sources directly, as before
+        stage_arena_ = nullptr;
+        std::fprintf(stderr, "strata: adaptive tier staging arena unavailable, copying pageable sources directly\n");
+        std::fflush(stderr);
+    }
     if (!ok) {
         res_ = nullptr;   // off
         err = "adaptive tier: cannot create the refill stream";
@@ -67,8 +80,22 @@ bool AdaptiveTier::copy(const Move& m, uint64_t off, uint64_t n, std::string& er
         err = "adaptive tier: a refill copy failed";
         return false;
     }
+    const void* src = b + off;
+    if (stage_arena_ != nullptr && !src_->pinned(m.layer, m.in)) {
+        if (n > kStageBlock || stage_free_.empty()) {   // cannot stage now: the pump stops, blocks return as batches retire
+            stage_blocked_ = true;
+            return true;
+        }
+        const size_t blk = stage_free_.back();
+        stage_free_.pop_back();
+        uint8_t* s = stage_arena_ + blk * kStageBlock;
+        std::memcpy(s, b + off, (size_t) n);   // the slice goes whole into the block's start
+        stage_used_.push_back(blk);
+        ++staged_now_;
+        src = s;
+    }
     cp_dst_.push_back(cache_->device_slot(m.slot) + off);
-    cp_src_.push_back(b + off);
+    cp_src_.push_back(src);
     cp_bytes_.push_back((size_t) n);
     sent_bytes += n;
     return true;
@@ -103,9 +130,13 @@ bool AdaptiveTier::end_batch(bool timed, uint64_t bytes, std::string& err) {
         if (cudaEventRecord(t1_, stream_) != cudaSuccess) { err = "adaptive tier: a refill copy failed"; return false; }
         timed_ = bytes;
     }
+    // the pump-side kMaxFlying cap makes this ring-full overwrite path unreachable
     if (flying_ < kBatches) ++flying_;
     const int i = (first_ + flying_ - 1) % kBatches;
     batch_sent_[i] = sent_;
+    batch_stage_[i] = std::move(stage_used_);   // the batch owns its staging blocks until it retires
+    stage_used_.clear();
+    staged_now_ = 0;
     if (cudaEventRecord(evs_[i], stream_) != cudaSuccess) { err = "adaptive tier: a refill copy failed"; return false; }
     return true;
 }
@@ -121,17 +152,21 @@ void AdaptiveTier::stage(uint64_t bytes) {
 }
 
 bool AdaptiveTier::pump_bytes(uint64_t bytes, std::string& err) {
+    retire();
+    if (flying_ >= (int) kMaxFlying) return true;   // never block the host thread that launches the second GPU's graphs
     if (sent_ >= staged_ || bytes < (64u << 10)) return true;
     OnDevice on(dev_, main_);
     const bool timed = time_begin(bytes >= (256u << 10));
     uint64_t done = 0;
     while (sent_ < staged_ && done < bytes) {
+        stage_blocked_ = false;
         const Move& m = queued_[sent_];
         const uint64_t blob = bytes_of(m);
         uint64_t n = std::min(bytes - done, blob - off_);
         if (off_ + n < blob) n &= ~(uint64_t) 4095;   // whole pages, but the blob's end
         if (n == 0) break;
         if (!copy(m, off_, n, err)) return false;
+        if (stage_blocked_) break;   // nothing staged for this slice: break BEFORE advancing done/off_/sent_
         done += n;
         off_ += n;
         if (off_ == blob) {
@@ -139,11 +174,15 @@ bool AdaptiveTier::pump_bytes(uint64_t bytes, std::string& err) {
             ++sent_;
         }
     }
-    return done == 0 || (send(err) && end_batch(timed, done, err));
+    if (done == 0) return true;
+    if (!send(err)) return false;
+    return end_batch(timed, done, err);
 }
 
 bool AdaptiveTier::pump(uint64_t budget, uint64_t& sent, std::string& err) {
     sent = 0;
+    retire();
+    if (flying_ >= (int) kMaxFlying) return true;   // never block the host thread that launches the second GPU's graphs
     size_t n = 0;
     for (; sent_ + n < queued_.size(); ++n) {
         const uint64_t b = bytes_of(queued_[sent_ + n]);
@@ -158,10 +197,20 @@ bool AdaptiveTier::pump(uint64_t budget, uint64_t& sent, std::string& err) {
         return false;
     }
     const bool timed = time_begin(n >= 4);   // a batch of a few copies: its start and end dominate
-    for (size_t i = 0; i < n; ++i, ++sent_) {
+    // the copies are only submitted by send() below, so evicting after queueing one keeps the resident out of the
+    // table before its slot is written; a blocked copy breaks BEFORE evict/sent_, leaving the move queued
+    uint64_t sub = 0;
+    for (size_t i = 0; i < n; ++i) {
+        stage_blocked_ = false;
+        const uint64_t mb = bytes_of(queued_[sent_]);
+        if (!copy(queued_[sent_], 0, mb, err)) return false;
+        if (stage_blocked_) break;
         evict(queued_[sent_]);
-        if (!copy(queued_[sent_], 0, bytes_of(queued_[sent_]), err)) return false;
+        ++sent_;
+        sub += mb;
     }
+    sent = sub;
+    if (sub == 0) return true;
     staged_ = sent_;
     return send(err) && end_batch(timed, sent, err);
 }
@@ -249,21 +298,36 @@ bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay
     return true;
 }
 
+// Retires the batches whose events have landed: advances the ring and returns the highest moves-sent index among them.
+size_t AdaptiveTier::retire() {
+    size_t landed = admitted_;   // the batches landed, oldest first
+    for (; flying_ > 0 && cudaEventQuery(evs_[first_]) == cudaSuccess; first_ = (first_ + 1) % kBatches, --flying_) {
+        for (const size_t blk : batch_stage_[first_]) stage_free_.push_back(blk);   // its copies have read the blocks
+        batch_stage_[first_].clear();
+        landed = std::max(landed, batch_sent_[first_]);
+    }
+    return landed;
+}
+
 void AdaptiveTier::apply_pending(bool wait) {
     if (wait && admitted_ < queued_.size()) {   // send the rest and wait for it
         std::string err;
         uint64_t sent = 0;
         if (!paced_) stage(UINT64_MAX);
-        if (!(paced_ ? pump(UINT64_MAX, sent, err) : pump_bytes(UINT64_MAX, err))) {
-            failed_ = err;
-            return;
+        // one pump may now stop early with the staging ring empty; keep pumping while it makes progress (the stream
+        // drains beside this loop, so retired batches return blocks), then sync and retire as before
+        for (;;) {
+            const size_t before = sent_;
+            if (!(paced_ ? pump(UINT64_MAX, sent, err) : pump_bytes(UINT64_MAX, err))) {
+                failed_ = err;
+                return;
+            }
+            if (sent_ >= queued_.size() || sent_ == before) break;
         }
         OnDevice on(dev_, main_);
         cudaStreamSynchronize(stream_);
     }
-    size_t landed = admitted_;   // the batches landed, oldest first
-    for (; flying_ > 0 && cudaEventQuery(evs_[first_]) == cudaSuccess; first_ = (first_ + 1) % kBatches, --flying_)
-        landed = std::max(landed, batch_sent_[first_]);
+    size_t landed = std::max(admitted_, retire());   // the batches landed, oldest first
     if (landed == admitted_) return;
     std::vector<int32_t>& res = *res_;
     for (; admitted_ < landed; ++admitted_) res[(size_t) pending_[admitted_].first] = pending_[admitted_].second;
