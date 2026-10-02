@@ -103,6 +103,8 @@ private:
     cudaStream_t stream_ = nullptr;
     // the batches in flight, oldest first: a ring of events, each with the moves sent when it was recorded
     static constexpr int kBatches = 64;
+    // bounds outstanding copy batches so the enqueue can never block the host thread that launches the second GPU's graphs
+    static constexpr size_t kMaxFlying = 2;
     cudaEvent_t evs_[kBatches] = {};
     size_t batch_sent_[kBatches] = {};
     int first_ = 0, flying_ = 0;
@@ -110,12 +112,23 @@ private:
     std::vector<void*> cp_dst_;
     std::vector<const void*> cp_src_;
     std::vector<size_t> cp_bytes_;
+    // pinned staging ring: a pageable source slice is staged into one of these pinned blocks so the batch's sources
+    // are always pinned (a pageable-source batch makes cudaMemcpyBatchAsync block the host thread).  A block is held
+    // by the batch whose copy reads it and returns to the free list when that batch retires.
+    uint8_t* stage_arena_ = nullptr;
+    static constexpr size_t kStageBlock = 8u << 20;
+    static constexpr size_t kStageBlocks = 8;
+    std::vector<size_t> stage_free_, stage_used_;
+    std::vector<std::vector<size_t>> batch_stage_;   // per ring slot: the blocks its batch reads
+    bool stage_blocked_ = false;                     // copy() could not stage: the pump stops early
+    size_t staged_now_ = 0;                          // slices staged into the batch being built
     uint64_t bytes_of(const Move& m) const;
     void evict(const Move& m);
     bool copy(const Move& m, uint64_t off, uint64_t n, std::string& err);
     bool send(std::string& err);
     bool time_begin(bool worth);
     bool end_batch(bool timed, uint64_t bytes, std::string& err);
+    size_t retire();
 };
 
 }  // namespace strata::core

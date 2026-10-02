@@ -1264,7 +1264,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
             ms_predict += ms_since(c);
         }
-        if (rows_in_ != nullptr && k + 1 < g.n_layers * G) rows_in_(rows_user_, l);
+        // the tier pump never runs while the second GPU is behind: its enqueue can block on a GPU that is
+        // spinning on the second-GPU flag, and this thread is what launches that GPU's next graph (deadlock)
+        if (rows_in_ != nullptr && k + 1 < g.n_layers * G &&
+            (!gpu2_ || *(volatile uint32_t*) sink_.gpu2_flag >= want))
+            rows_in_(rows_user_, l);
     }
     while (late_flag != nullptr && ms_since(late_at) < 50.0) {   // the last layer's (the graph ends after them)
         settle(false);
